@@ -51,22 +51,23 @@ pub async fn run(
     let mut changed = false;
     let mut pressed_keys = HashSet::new();
 
+    // Manage active socket state
+    let socket_is_active = rkvm_state::init("/run/rkvm/active.sock").await.unwrap();
+
     let (events_sender, mut events_receiver) = mpsc::channel(1);
 
     loop {
         let event = async { events_receiver.recv().await.unwrap() };
 
         tokio::select! {
+            // New client connection
             result = listener.accept() => {
                 let (stream, addr) = result.map_err(Error::Network)?;
                 let acceptor = acceptor.clone();
                 let password = password.to_owned();
 
-                // Remove dead clients.
                 clients.retain(|_, (client, _)| !client.is_closed());
-                if !clients.contains(current) {
-                    current = 0;
-                }
+                if !clients.contains(current) { current = 0; }
 
                 let init_updates = devices
                     .iter()
@@ -100,6 +101,8 @@ pub async fn run(
                     .instrument(span),
                 );
             }
+
+            // New device monitored
             result = monitor.read() => {
                 let mut interceptor = result.map_err(Error::Input)?;
 
@@ -126,7 +129,6 @@ pub async fn run(
                         delay: repeat.delay,
                         period: repeat.period,
                     };
-
                     let _ = sender.send(update).await;
                 }
 
@@ -159,12 +161,9 @@ pub async fn run(
                                     None => break,
                                 };
 
-                                match interceptor.write(&event).await {
-                                    Ok(()) => {},
-                                    Err(err) => {
-                                        let _ = events_sender.send((id, Err(err))).await;
-                                        break;
-                                    }
+                                if interceptor.write(&event).await.is_err() {
+                                    let _ = events_sender.send((id, Err(io::Error::new(io::ErrorKind::Other, "write failed")))).await;
+                                    break;
                                 }
 
                                 tracing::trace!(id = %id, "Wrote an event to device");
@@ -174,7 +173,6 @@ pub async fn run(
                 });
 
                 let device = &devices[id];
-
                 tracing::info!(
                     id = %id,
                     name = ?device.name,
@@ -184,6 +182,8 @@ pub async fn run(
                     "Registered new device"
                 );
             }
+
+            // Input event
             (id, result) = event => match result {
                 Ok(event) => {
                     let mut press = false;
@@ -191,7 +191,6 @@ pub async fn run(
                     if let Event::Key(KeyEvent { key, down }) = event {
                         if switch_keys.contains(&key) {
                             press = true;
-
                             match down {
                                 true => pressed_keys.insert(key),
                                 false => pressed_keys.remove(&key),
@@ -199,7 +198,6 @@ pub async fn run(
                         }
                     }
 
-                    // Who to send this event to.
                     let mut idx = current;
 
                     if press {
@@ -207,9 +205,7 @@ pub async fn run(
                             let exists = |idx| idx == 0 || clients.contains(idx - 1);
                             loop {
                                 current = (current + 1) % (clients.len() + 1);
-                                if exists(current) {
-                                    break;
-                                }
+                                if exists(current) { break; }
                             }
 
                             previous = idx;
@@ -217,52 +213,46 @@ pub async fn run(
 
                             if current != 0 {
                                 tracing::info!(idx = %current, addr = %clients[current - 1].1, "Switched client");
+                                let mut active = socket_is_active.write().await;
+                                *active = false; // Client now active
                             } else {
                                 tracing::info!(idx = %current, "Switched client");
+                                let mut active = socket_is_active.write().await;
+                                *active = true; // Server regained control
                             }
                         } else if changed {
                             idx = previous;
-
-                            if pressed_keys.is_empty() {
-                                changed = false;
-                            }
+                            if pressed_keys.is_empty() { changed = false; }
                         }
                     }
 
-                    if press && !propagate_switch_keys {
-                        continue;
-                    }
+                    if press && !propagate_switch_keys { continue; }
 
-                    let events = [event]
-                        .into_iter()
-                        .chain(press.then_some(Event::Sync(SyncEvent::All)));
+                    let events = [event].into_iter().chain(press.then_some(Event::Sync(SyncEvent::All)));
 
-                    // Index 0 - special case to keep the modular arithmetic above working.
                     if idx == 0 {
-                        // We do a try_send() here rather than a "blocking" send in order to prevent deadlocks.
-                        // In this scenario, the interceptor task is sending events to the main task,
-                        // while the main task is simultaneously sending events back to the interceptor.
-                        // This creates a classic deadlock situation where both tasks are waiting for each other.
                         for event in events {
                             match devices[id].sender.try_send(event) {
                                 Ok(()) | Err(TrySendError::Closed(_)) => {},
                                 Err(TrySendError::Full(_)) => return Err(Error::Overflow),
                             }
                         }
-
                         continue;
                     }
 
                     for event in events {
                         if clients[idx - 1].0.send(Update::Event { id, event }).await.is_err() {
                             clients.remove(idx - 1);
-
-                            if current == idx {
-                                current = 0;
+                            if clients.is_empty() {
+                                let mut active = socket_is_active.write().await;
+                                *active = true;
+                                tracing::info!("RKVM active socket set to inactive");
                             }
+                            if current == idx { current = 0; }
                         }
                     }
                 }
+
                 Err(err) if err.kind() == ErrorKind::BrokenPipe => {
                     for (_, (sender, _)) in &clients {
                         let _ = sender.send(Update::DestroyDevice { id }).await;
@@ -270,7 +260,14 @@ pub async fn run(
                     devices.remove(id);
 
                     tracing::info!(id = %id, "Destroyed device");
+
+                    if clients.is_empty() {
+                        let mut active = socket_is_active.write().await;
+                        *active = true;
+                        tracing::info!("RKVM active socket set to inactive");
+                    }
                 }
+
                 Err(err) => return Err(Error::Input(err)),
             }
         }
@@ -287,6 +284,7 @@ struct Device {
     keys: HashSet<Key>,
     delay: Option<i32>,
     period: Option<i32>,
+
     sender: Sender<Event>,
 }
 

@@ -22,7 +22,7 @@ tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 tracing = "0.1.37"
 rkvm-net = { path = "../rkvm-net" }
 rkvm-input = { path = "../rkvm-input" }
-
+rkvm-state = { path = "../rkvm-state" }
 [package.metadata.rpm]
 package = "rkvm-server"
 

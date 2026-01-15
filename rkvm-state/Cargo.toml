@@ -1,0 +1,7 @@
+[package]
+name = "rkvm-state"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.0.1", features = ["fs", "io-util", "net", "sync", "rt", "time", "macros"] }
