@@ -26,6 +26,12 @@ pub enum Error {
     Auth,
 }
 
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Error::Input(err)
+    }
+}
+
 pub async fn run(
     hostname: &ServerName,
     port: u16,
@@ -138,7 +144,7 @@ pub async fn run(
                     )));
                 }
 
-                let writer = Writer::builder()
+                let writer: Writer = Writer::builder()?
                     .name(&name)
                     .vendor(vendor)
                     .product(product)
