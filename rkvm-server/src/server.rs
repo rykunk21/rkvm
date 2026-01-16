@@ -218,9 +218,8 @@ pub async fn run(
                                 *active_ref = active;
                             }
 
-                            // Broadcast control update to all clients
                             for (_, (sender, _)) in &clients {
-                                let _ = sender.send(Update::Control { active }).await;
+                                let _ = sender.send(Update::Control { active: !active }).await;
                             }
 
                             if active {
