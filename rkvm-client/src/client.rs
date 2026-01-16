@@ -32,6 +32,11 @@ pub async fn run(
     connector: TlsConnector,
     password: &str,
 ) -> Result<(), Error> {
+    // Initialize RKVM active socket
+    let socket_is_active = rkvm_state::init("/run/rkvm/active.sock")
+        .await
+        .unwrap_or_else(|_| panic!("Failed to initialize active socket"));
+
     // Intentionally don't impose any timeout for TCP connect.
     let stream = match hostname {
         ServerName::DnsName(name) => TcpStream::connect(&(name.as_ref(), port)).await,
@@ -56,7 +61,6 @@ pub async fn run(
     rkvm_net::timeout(rkvm_net::WRITE_TIMEOUT, async {
         Version::CURRENT.encode(&mut stream).await?;
         stream.flush().await?;
-
         Ok(())
     })
     .await
@@ -82,7 +86,6 @@ pub async fn run(
     rkvm_net::timeout(rkvm_net::WRITE_TIMEOUT, async {
         response.encode(&mut stream).await?;
         stream.flush().await?;
-
         Ok(())
     })
     .await
@@ -93,19 +96,21 @@ pub async fn run(
         .map_err(Error::Network)?;
 
     match status {
-        AuthStatus::Passed => {}
+        AuthStatus::Passed => {
+            // Client is now active
+            let mut active = socket_is_active.write().await;
+            *active = false;
+        }
         AuthStatus::Failed => return Err(Error::Auth),
     }
 
     tracing::info!("Authenticated successfully");
 
     let mut start = Instant::now();
-
     let mut interval = time::interval(rkvm_net::PING_INTERVAL + rkvm_net::READ_TIMEOUT);
-    let mut writers = HashMap::new();
-
-    // Interval ticks immediately after creation.
     interval.tick().await;
+
+    let mut writers = HashMap::new();
 
     loop {
         let update = tokio::select! {
@@ -126,32 +131,28 @@ pub async fn run(
                 delay,
                 period,
             } => {
-                let entry = writers.entry(id);
-                if let Entry::Occupied(_) = entry {
+                if writers.contains_key(&id) {
                     return Err(Error::Network(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "Server created the same device twice",
                     )));
                 }
 
-                let writer = async {
-                    Writer::builder()?
-                        .name(&name)
-                        .vendor(vendor)
-                        .product(product)
-                        .version(version)
-                        .rel(rel)?
-                        .abs(abs)?
-                        .key(keys)?
-                        .delay(delay)?
-                        .period(period)?
-                        .build()
-                        .await
-                }
-                .await
-                .map_err(Error::Input)?;
+                let writer = Writer::builder()
+                    .name(&name)
+                    .vendor(vendor)
+                    .product(product)
+                    .version(version)
+                    .rel(rel)?
+                    .abs(abs)?
+                    .key(keys)?
+                    .delay(delay)?
+                    .period(period)?
+                    .build()
+                    .await
+                    .map_err(Error::Input)?;
 
-                entry.or_insert(writer);
+                writers.insert(id, writer);
 
                 tracing::info!(
                     id = %id,
@@ -162,16 +163,19 @@ pub async fn run(
                     "Created new device"
                 );
             }
-            Update::DestroyDevice { id } => {
-                if writers.remove(&id).is_none() {
-                    return Err(Error::Network(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Server destroyed a nonexistent device",
-                    )));
-                }
 
+            Update::DestroyDevice { id } => {
+                writers.remove(&id);
                 tracing::info!(id = %id, "Destroyed device");
+
+                // If no writers left, client is no longer active
+                if writers.is_empty() {
+                    let mut active = socket_is_active.write().await;
+                    *active = true;
+                    tracing::info!("RKVM active socket set to active (no devices)");
+                }
             }
+
             Update::Event { id, event } => {
                 let writer = writers.get_mut(&id).ok_or_else(|| {
                     Error::Network(io::Error::new(
@@ -181,20 +185,18 @@ pub async fn run(
                 })?;
 
                 writer.write(&event).await.map_err(Error::Input)?;
-
                 tracing::trace!(id = %id, "Wrote an event to device");
             }
+
             Update::Ping => {
                 let duration = start.elapsed();
                 tracing::debug!(duration = ?duration, "Received ping");
-
                 start = Instant::now();
                 interval.reset();
 
                 rkvm_net::timeout(rkvm_net::WRITE_TIMEOUT, async {
                     Pong.encode(&mut stream).await?;
                     stream.flush().await?;
-
                     Ok(())
                 })
                 .await

@@ -806,6 +806,7 @@ dependencies = [
  "env_logger",
  "rkvm-input",
  "rkvm-net",
+ "rkvm-state",
  "rustls-pemfile",
  "serde",
  "thiserror",

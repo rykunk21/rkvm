@@ -1,11 +1,11 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::RwLock;
 use tokio::time::{self, Duration};
-
 pub type SocketState = Arc<RwLock<bool>>;
 
 /// Initialize the UNIX socket at `socket_path` and spawn broadcaster task.
@@ -20,6 +20,8 @@ pub async fn init(socket_path: &str) -> std::io::Result<SocketState> {
     let _ = fs::remove_file(socket_path);
 
     let listener = UnixListener::bind(socket_path)?;
+
+    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o666))?;
     let active = Arc::new(RwLock::new(true));
     let active_clone = active.clone();
 
