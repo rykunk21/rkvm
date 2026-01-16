@@ -199,7 +199,6 @@ pub async fn run(
                     }
 
                     let mut idx = current;
-
                     if press {
                         if pressed_keys.len() == switch_keys.len() {
                             let exists = |idx| idx == 0 || clients.contains(idx - 1);
@@ -211,14 +210,23 @@ pub async fn run(
                             previous = idx;
                             changed = true;
 
-                            if current != 0 {
-                                tracing::info!(idx = %current, addr = %clients[current - 1].1, "Switched client");
-                                let mut active = socket_is_active.write().await;
-                                *active = false; // Client now active
+                            let active = current == 0;
+
+                            // Update the socket
+                            {
+                                let mut active_ref = socket_is_active.write().await;
+                                *active_ref = active;
+                            }
+
+                            // Broadcast control update to all clients
+                            for (_, (sender, _)) in &clients {
+                                let _ = sender.send(Update::Control { active }).await;
+                            }
+
+                            if active {
+                                tracing::info!("Server regained control; socket set active");
                             } else {
-                                tracing::info!(idx = %current, "Switched client");
-                                let mut active = socket_is_active.write().await;
-                                *active = true; // Server regained control
+                                tracing::info!(idx = %current, addr = %clients[current - 1].1, "Switched client; socket set inactive");
                             }
                         } else if changed {
                             idx = previous;

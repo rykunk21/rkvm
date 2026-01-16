@@ -50,6 +50,9 @@ pub enum Update {
         event: Event,
     },
     Ping,
+    Control {
+        active: bool,
+    },
 }
 
 #[derive(Deserialize, Serialize, Debug)]
